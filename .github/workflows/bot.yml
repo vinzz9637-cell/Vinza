@@ -1,8 +1,6 @@
 name: Run Vinza Bot
 on:
   workflow_dispatch:
-  push:
-    branches: [utama]
 jobs:
   run-bot:
     runs-on: ubuntu-latest
@@ -12,4 +10,6 @@ jobs:
         with:
           node-version: '18'
       - run: npm install
-      - run: npm start
+      - run: |
+          npx localtunnel --port 3000 --print-requests &
+          npm start
