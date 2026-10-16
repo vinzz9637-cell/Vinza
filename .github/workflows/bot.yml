@@ -9,7 +9,12 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '18'
-      - run: npm install
-      - run: |
-          npx localtunnel --port 3000 --print-requests &
-          npm start
+      - name: Install
+        run: npm install
+      - name: Run Server + Tunnel
+        run: |
+          node server.js &
+          echo "Tunggu server nyala 5 detik..."
+          sleep 5
+          echo "Buka tunnel..."
+          npx localtunnel --port 3000 --print-requests
