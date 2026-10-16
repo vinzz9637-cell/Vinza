@@ -11,10 +11,13 @@ jobs:
           node-version: '18'
       - name: Install
         run: npm install
-      - name: Run Server + Tunnel
+      - name: Run Server + Cloudflare Tunnel
         run: |
+          echo "Download cloudflared..."
+          curl -L https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o cloudflared
+          chmod +x cloudflared
+          echo "Start server..."
           node server.js &
-          echo "Tunggu server nyala 5 detik..."
-          sleep 5
-          echo "Buka tunnel..."
-          npx localtunnel --port 3000 --print-requests
+          sleep 4
+          echo "Start tunnel - tunggu link muncul..."
+          ./cloudflared tunnel --url http://localhost:3000
