@@ -1,0 +1,353 @@
+import json
+import os
+from datetime import datetime
+
+import qriskit
+import requests
+from pyzxing import BarCodeReader
+
+OUTPUT_DIR = "laporan_qris"
+
+
+# ============================================================
+# 1. EKSTRAKSI
+# ============================================================
+
+def payload_dari_gambar(path_gambar: str) -> str:
+    reader = BarCodeReader()
+    hasil = reader.decode(path_gambar)
+    if not hasil:
+        raise ValueError("QR tidak terbaca. Scan manual, tempel payload-nya.")
+    item = hasil[0]
+    return item.get("parsedText") or item.get("rawBytes")
+
+
+def ekstrak_qris(payload: str) -> dict:
+    q = qriskit.parse(payload)
+
+    acquirers = []
+    for acc in (q.merchant_accounts or []):
+        if acc.acquirer:
+            acquirers.append({
+                "nama": acc.acquirer.name,
+                "kode": getattr(acc.acquirer, "code", None),
+            })
+
+    validasi = []
+    for v in qriskit.validate(payload):
+        validasi.append({
+            "severity": v.severity,
+            "code": v.code,
+            "pesan": v.message,
+        })
+
+    return {
+        "payload": payload,
+        "nama_merchant": q.merchant_name,
+        "nmid": q.nmid,
+        "kota": getattr(q, "city", None),
+        "kode_pos": getattr(q, "postal_code", None),
+        "kriteria": getattr(q, "merchant_criteria", None),
+        "acquirer": acquirers,
+        "validasi": validasi,
+        "crc_valid": not any(v["code"] == "CRC" for v in validasi),
+    }
+
+
+# ============================================================
+# 2. GEOCODE WILAYAH (KOTA REGISTRASI, BUKAN ALAMAT)
+# ============================================================
+
+def geocode_kota(kota: str) -> dict | None:
+    if not kota:
+        return None
+    try:
+        r = requests.get(
+            "https://nominatim.openstreetmap.org/search",
+            params={"q": f"{kota}, Indonesia", "format": "json", "limit": 1},
+            headers={"User-Agent": "qris-report/2.0"},
+            timeout=15,
+        )
+        r.raise_for_status()
+        data = r.json()
+        if not data:
+            return None
+        d = data[0]
+        return {
+            "label": d.get("display_name"),
+            "lat": d.get("lat"),
+            "lon": d.get("lon"),
+            "osm": f"https://www.openstreetmap.org/?mlat={d.get('lat')}&mlon={d.get('lon')}#map=12/{d.get('lat')}/{d.get('lon')}",
+        }
+    except requests.RequestException:
+        return None
+
+
+# ============================================================
+# 3. GENERATOR LAPORAN IASC
+# ============================================================
+
+TEMPLATE_IASC = """LAPORAN DUGAAN PENIPUAN BERBASIS QRIS
+Dibuat: {waktu}
+
+A. PELAPOR
+   Nama      : {pelapor_nama}
+   No. HP    : {pelapor_hp}
+   Email     : {pelapor_email}
+
+B. TRANSAKSI
+   Tanggal   : {tgl}
+   Nominal   : Rp {nominal}
+   Bukti     : {bukti}
+
+C. DATA MERCHANT (dari payload QRIS)
+   Nama      : {nama_merchant}
+   NMID      : {nmid}
+   Kota      : {kota}
+   Kode Pos  : {kode_pos}
+   Kriteria  : {kriteria}
+   Acquirer  : {acquirer}
+   CRC valid : {crc}
+
+   Catatan: kota di atas adalah kota registrasi merchant pada
+   payload QRIS. Alamat fisik hanya dapat dibuka oleh PJP/bank
+   melalui permintaan resmi aparat penegak hukum.
+
+D. INDIKASI KEANEHAN
+{indikasi}
+
+E. PAYLOAD MENTAH
+{payload}
+
+F. PERMINTAAN
+   1. Pemblokiran rekening tujuan atas dugaan penipuan.
+   2. Penelusuran identitas pemilik merchant via NMID.
+   3. Tindak lanjut hukum.
+
+Hormat saya,
+{pelapor_nama}
+"""
+
+
+def susun_indikasi(data: dict) -> str:
+    poin = []
+    if not data["nmid"]:
+        poin.append("- NMID tidak ada pada payload.")
+    if not data["crc_valid"]:
+        poin.append("- CRC tidak valid, payload kemungkinan dimodifikasi.")
+    if not data["acquirer"]:
+        poin.append("- Acquirer tidak teridentifikasi.")
+    if not data["nama_merchant"]:
+        poin.append("- Nama merchant kosong.")
+    for v in data["validasi"]:
+        if v["severity"].lower() in ("error", "warning"):
+            poin.append(f"- [{v['severity']}] {v['code']}: {v['pesan']}")
+    if not poin:
+        poin.append("- Struktur QRIS formal valid. Indikasi penipuan berasal dari "
+                     "ketidaksesuaian identitas pelaku dengan nama merchant.")
+    return "\n".join(poin)
+
+
+def tulis_laporan_iasc(data: dict, meta: dict) -> str:
+    acquirer_str = ", ".join(
+        f"{a['nama']} ({a['kode'] or '-'})" for a in data["acquirer"]
+    ) or "Tidak teridentifikasi"
+
+    isi = TEMPLATE_IASC.format(
+        waktu=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        pelapor_nama=meta.get("nama", "-"),
+        pelapor_hp=meta.get("hp", "-"),
+        pelapor_email=meta.get("email", "-"),
+        tgl=meta.get("tgl", "-"),
+        nominal=f"{meta.get('nominal', 0):,}".replace(",", "."),
+        bukti=meta.get("bukti", "-"),
+        nama_merchant=data["nama_merchant"] or "-",
+        nmid=data["nmid"] or "-",
+        kota=data["kota"] or "-",
+        kode_pos=data["kode_pos"] or "-",
+        kriteria=data["kriteria"] or "-",
+        acquirer=acquirer_str,
+        crc="Ya" if data["crc_valid"] else "TIDAK",
+        indikasi=susun_indikasi(data),
+        payload=data["payload"],
+    )
+
+    path = os.path.join(OUTPUT_DIR, "laporan_iasc.txt")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(isi)
+    return path
+
+
+# ============================================================
+# 4. GENERATOR SURAT PERMINTAAN DATA KE PJP/BANK
+#    (untuk ditandatangani/dilampirkan penyidik patrolisiber)
+# ============================================================
+
+TEMPLATE_SURAT_PJP = """Kepada Yth.
+Divisi Kepatuhan / Legal / Financial Crime
+{aquirer_utama}
+
+Perihal: Permintaan Data dan Pemblokiran Terkait Dugaan Penipuan QRIS
+
+Dengan hormat,
+
+Bersama surat ini kami sampaikan permintaan penelusuran dan
+pemblokiran atas dugaan tindak pidana penipuan dengan modus
+QRIS, dengan data sebagai berikut:
+
+   Nomor Laporan     : {no_laporan}
+   Tanggal Laporan   : {tgl_laporan}
+   Instansi Pelapor  : {instansi}
+   Nama Pelapor      : {pelapor_nama}
+   No. HP Pelapor    : {pelapor_hp}
+
+DETAIL MERCHANT TERDUGA:
+   Nama Merchant     : {nama_merchant}
+   NMID              : {nmid}
+   Kota Registrasi   : {kota}
+   Acquirer          : {acquirer}
+   Payload QRIS      : {payload}
+
+KERUGIAN PELAPOR:
+   Tanggal Transaksi : {tgl}
+   Nominal           : Rp {nominal}
+   Bukti             : {bukti}
+
+Berdasarkan hal tersebut, kami memohon bantuan Saudara untuk:
+
+   1. Menelusuri identitas pemilik rekening/merchant berdasarkan
+      NMID di atas.
+   2. Memblokir rekening/merchant terkait selama proses
+      penyelidikan berlangsung.
+   3. Menyampaikan data identitas (KTP, alamat, nomor rekening,
+      riwayat transaksi) kepada penyidik sesuai ketentuan
+      peraturan perundang-undangan.
+
+Demikian permohonan ini kami sampaikan. Atas perhatian dan
+kerja sama Saudara, kami ucapkan terima kasih.
+
+{instansi}
+{tgl_laporan}
+
+({nama_penyidik})
+{nip}
+"""
+
+
+def tulis_surat_pjp(data: dict, meta: dict, penyidik: dict) -> str:
+    if not data["acquirer"]:
+        raise ValueError("Acquirer tidak teridentifikasi, surat tidak bisa ditujukan.")
+
+    acquirer_str = ", ".join(
+        f"{a['nama']} ({a['kode'] or '-'})" for a in data["acquirer"]
+    )
+    acquirer_utama = data["acquirer"][0]["nama"]
+
+    isi = TEMPLATE_SURAT_PJP.format(
+        aquirer_utama=acquirer_utama,
+        no_laporan=meta.get("no_laporan", "-"),
+        tgl_laporan=meta.get("tgl_laporan", datetime.now().strftime("%Y-%m-%d")),
+        instansi=penyidik.get("instansi", "-"),
+        pelapor_nama=meta.get("nama", "-"),
+        pelapor_hp=meta.get("hp", "-"),
+        nama_merchant=data["nama_merchant"] or "-",
+        nmid=data["nmid"] or "-",
+        kota=data["kota"] or "-",
+        acquirer=acquirer_str,
+        payload=data["payload"],
+        tgl=meta.get("tgl", "-"),
+        nominal=f"{meta.get('nominal', 0):,}".replace(",", "."),
+        bukti=meta.get("bukti", "-"),
+        nama_penyidik=penyidik.get("nama", "-"),
+        nip=penyidik.get("nip", "-"),
+    )
+
+    path = os.path.join(OUTPUT_DIR, f"surat_permintaan_{acquirer_utama.replace(' ', '_')}.txt")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(isi)
+    return path
+
+
+# ============================================================
+# 5. CHECKLIST BUKTI
+# ============================================================
+
+CHECKLIST = """CHECKLIST BUKTI SEBELUM LAPOR
+[x] Screenshot tampilan nama merchant saat scan QRIS
+[x] Screenshot nominal dan konfirmasi pembayaran
+[x] Bukti transfer (mutasi rekening / e-wallet)
+[x] File gambar QRIS asli (jangan di-crop)
+[x] Payload QRIS mentah (hasil scan)
+[x] Kronologi singkat: tanggal, jam, cara pelaku menghubungi
+[x] Screenshot chat dengan pelaku (jika ada)
+[x] Nomor laporan IASC OJK (jika sudah dibuat)
+"""
+
+
+def tulis_checklist() -> str:
+    path = os.path.join(OUTPUT_DIR, "checklist_bukti.txt")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(CHECKLIST)
+    return path
+
+
+# ============================================================
+# 6. ENTRY POINT
+# ============================================================
+
+def jalankan(gambar=None, payload_manual=None):
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+    meta = {
+        "nama": "Nama Lengkap Kamu",
+        "hp": "08xxxxxxxxxx",
+        "email": "email@kamu.com",
+        "tgl": "2026-11-12",
+        "nominal": 500000,
+        "bukti": "bukti_transfer.jpg",
+        "no_laporan": "IASC-XXXXXXXX",
+        "tgl_laporan": datetime.now().strftime("%Y-%m-%d"),
+    }
+
+    penyidik = {
+        "instansi": "Patroli Siber - Polda X",
+        "nama": "Nama Penyidik",
+        "nip": "NIP. XXXXXXXXX",
+    }
+
+    payload = payload_manual or payload_dari_gambar(gambar)
+    data = ekstrak_qris(payload)
+
+    print("=" * 55)
+    print("DATA MERCHANT")
+    print("=" * 55)
+    print(f"Nama    : {data['nama_merchant']}")
+    print(f"NMID    : {data['nmid']}")
+    print(f"Kota    : {data['kota']}")
+    print(f"Acquirer: {data['acquirer']}")
+    print(f"CRC     : {'valid' if data['crc_valid'] else 'TIDAK VALID'}")
+    print("=" * 55)
+
+    koord = geocode_kota(data["kota"])
+    if koord:
+        print(f"\nWilayah registrasi (bukan alamat): {koord['label']}")
+        print(f"Peta: {koord['osm']}")
+
+    p1 = tulis_laporan_iasc(data, meta)
+    p2 = tulis_surat_pjp(data, meta, penyidik)
+    p3 = tulis_checklist()
+
+    print(f"\n[+] Laporan IASC       : {p1}")
+    print(f"[+] Surat ke PJP/bank  : {p2}")
+    print(f"[+] Checklist bukti    : {p3}")
+
+    return data
+
+
+if __name__ == "__main__":
+    # Opsi A: dari gambar
+    # jalankan(gambar="qris_penipu.jpg")
+
+    # Opsi B: dari payload yang di-scan manual
+    payload = "00020101021126..."  # ganti dengan payload asli
+    jalankan(payload_manual=payload)
